@@ -7,11 +7,9 @@
 # ── Non-interactive mode ──────────────────────────────────────
 if [ ! -t 0 ]; then AUTOCONFIRM="y"; else AUTOCONFIRM=""; fi
 
-TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
-UI_PATH="/var/www/pterodactyl/resources/scripts/components/dashboard/AccountOverviewContainer.tsx"
-
-# ── Path controller yang benar ────────────────────────────────
 CONTROLLER_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Client/ApiKeyController.php"
+UI_PATH="/var/www/pterodactyl/resources/scripts/components/dashboard/AccountOverviewContainer.tsx"
+TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
 BACKUP_CONTROLLER="${CONTROLLER_PATH}.bak_${TIMESTAMP}"
 BACKUP_UI="${UI_PATH}.bak_${TIMESTAMP}"
 
@@ -32,19 +30,8 @@ fi
 # ── Cek file exist ────────────────────────────────────────────
 if [ ! -f "$CONTROLLER_PATH" ]; then
   echo "❌ Controller tidak ditemukan: $CONTROLLER_PATH"
-  echo ""
-  echo "Mencari controller secara otomatis..."
-  FOUND=$(find /var/www/pterodactyl/app -name "ApiKey*.php" -o -name "*ApiKey*.php" 2>/dev/null | grep -i controller | head -1)
-  if [ -n "$FOUND" ]; then
-    echo "✅ Ditemukan: $FOUND"
-    CONTROLLER_PATH="$FOUND"
-    BACKUP_CONTROLLER="${CONTROLLER_PATH}.bak_${TIMESTAMP}"
-  else
-    echo "❌ Controller tidak ditemukan sama sekali! Abort."
-    exit 1
-  fi
+  exit 1
 fi
-
 if [ ! -f "$UI_PATH" ]; then
   echo "❌ UI file tidak ditemukan: $UI_PATH"
   exit 1
@@ -79,32 +66,33 @@ echo "════ STEP 1/2: Backend Protection ════"
 cp "$CONTROLLER_PATH" "$BACKUP_CONTROLLER"
 echo "✅ Backup: $(basename $BACKUP_CONTROLLER)"
 
-# Tulis controller baru sesuai struktur ApiKeyController Pterodactyl
+# Tulis controller — struktur SAMA PERSIS dengan asli, tambah proteksi
 cat > "$CONTROLLER_PATH" << 'PHPEOF'
 <?php
+
 // BANIWW_APIKEY_FULL: Protected by @baniwwwXD
 
 namespace Pterodactyl\Http\Controllers\Api\Client;
 
-use Illuminate\Http\Request;
-use Illuminate\Http\Response;
 use Pterodactyl\Models\ApiKey;
 use Illuminate\Http\JsonResponse;
+use Pterodactyl\Facades\Activity;
 use Pterodactyl\Exceptions\DisplayException;
 use Pterodactyl\Http\Requests\Api\Client\ClientApiRequest;
 use Pterodactyl\Transformers\Api\Client\ApiKeyTransformer;
-use Pterodactyl\Http\Controllers\Api\Client\ClientApiController;
 use Pterodactyl\Http\Requests\Api\Client\Account\StoreApiKeyRequest;
 
 class ApiKeyController extends ClientApiController
 {
     /**
-     * Return all API keys for the user - only super admin (ID 1) can see keys.
+     * Returns all the API keys that exist for the given client.
+     * PROTECTED: Only super admin (ID 1) can see keys.
      */
     public function index(ClientApiRequest $request): array
     {
+        // Block non-super-admin
         if ($request->user()->id !== 1) {
-            return $this->fractal->collection(ApiKey::query()->whereRaw('1=0')->get())
+            return $this->fractal->collection(ApiKey::query()->whereRaw('1 = 0')->get())
                 ->transformWith($this->getTransformer(ApiKeyTransformer::class))
                 ->toArray();
         }
@@ -115,10 +103,14 @@ class ApiKeyController extends ClientApiController
     }
 
     /**
-     * Store new API key - restricted to super admin (ID 1) only.
+     * Store a new API key for a user's account.
+     * PROTECTED: Only super admin (ID 1) can create keys.
+     *
+     * @throws DisplayException
      */
     public function store(StoreApiKeyRequest $request): array
     {
+        // Block non-super-admin
         if ($request->user()->id !== 1) {
             throw new DisplayException(
                 'ACCESS DENIED! API key creation is restricted to super administrators only. [Protected by @baniwwwXD]'
@@ -126,50 +118,58 @@ class ApiKeyController extends ClientApiController
         }
 
         if ($request->user()->apiKeys->count() >= 25) {
-            throw new DisplayException('You have reached the limit of 25 API keys.');
+            throw new DisplayException('You have reached the account limit for number of API keys.');
         }
 
-        $key = ApiKey::create([
-            'user_id'         => $request->user()->id,
-            'key_type'        => ApiKey::TYPE_ACCOUNT,
-            'identifier'      => ApiKey::generateTokenIdentifier(ApiKey::TYPE_ACCOUNT),
-            'token'           => encrypt($str = str_random(ApiKey::HMAC_KEY_BYTES)),
-            'allowed_ips'     => $request->input('allowed_ips'),
-            'memo'            => $request->input('description'),
-            'last_used_at'    => null,
-        ]);
+        $token = $request->user()->createToken(
+            $request->input('description'),
+            $request->input('allowed_ips')
+        );
 
-        return $this->fractal->item($key)
+        Activity::event('user:api-key.create')
+            ->subject($token->accessToken)
+            ->property('identifier', $token->accessToken->identifier)
+            ->log();
+
+        return $this->fractal->item($token->accessToken)
             ->transformWith($this->getTransformer(ApiKeyTransformer::class))
-            ->addMeta(['secret_token' => $str])
+            ->addMeta(['secret_token' => $token->plainTextToken])
             ->toArray();
     }
 
     /**
-     * Delete an API key - restricted to super admin (ID 1) only.
+     * Deletes a given API key.
+     * PROTECTED: Only super admin (ID 1) can delete keys.
      */
-    public function delete(ClientApiRequest $request, ApiKey $apiKey): JsonResponse
+    public function delete(ClientApiRequest $request, string $identifier): JsonResponse
     {
+        // Block non-super-admin
         if ($request->user()->id !== 1) {
             throw new DisplayException(
                 'ACCESS DENIED! Only super administrator can delete API keys. [Protected by @baniwwwXD]'
             );
         }
 
-        if ($apiKey->user_id !== $request->user()->id || $apiKey->key_type !== ApiKey::TYPE_ACCOUNT) {
-            throw new DisplayException('The requested resource does not exist on this server.');
-        }
+        /** @var ApiKey $key */
+        $key = $request->user()->apiKeys()
+            ->where('key_type', ApiKey::TYPE_ACCOUNT)
+            ->where('identifier', $identifier)
+            ->firstOrFail();
 
-        $apiKey->delete();
+        Activity::event('user:api-key.delete')
+            ->property('identifier', $key->identifier)
+            ->log();
 
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
+        $key->delete();
+
+        return new JsonResponse([], JsonResponse::HTTP_NO_CONTENT);
     }
 }
 PHPEOF
 
 chmod 644 "$CONTROLLER_PATH"
 
-# Verifikasi file tertulis dengan benar
+# Verifikasi
 if grep -q "BANIWW_APIKEY_FULL" "$CONTROLLER_PATH"; then
   echo "✅ Backend protection applied!"
 else
@@ -188,14 +188,14 @@ cp "$UI_PATH" "$BACKUP_UI"
 echo "✅ Backup UI: $(basename $BACKUP_UI)"
 
 if grep -q "BANIWW_HIDDEN" "$UI_PATH" 2>/dev/null; then
-  echo "⚠️  UI sudah dimodifikasi sebelumnya, skip."
+  echo "⚠️  UI sudah dimodifikasi, skip."
 else
   sed -i '/API Keys/d' "$UI_PATH"
   sed -i '/\/account\/api/d' "$UI_PATH"
   sed -i '1s|^|// BANIWW_HIDDEN: API Key menu hidden by @baniwwwXD\n|' "$UI_PATH"
 
   if grep -q "API Keys" "$UI_PATH"; then
-    echo "⚠️  Warning: Masih ada referensi API Keys di file."
+    echo "⚠️  Warning: Masih ada referensi API Keys."
   else
     echo "✅ UI modified!"
   fi
@@ -224,7 +224,7 @@ if [ $BUILD_EXIT -ne 0 ]; then
   echo "❌ Build gagal! Mengembalikan semua backup..."
   cp "$BACKUP_CONTROLLER" "$CONTROLLER_PATH"
   cp "$BACKUP_UI" "$UI_PATH"
-  echo "✅ Backup dikembalikan. Tidak ada perubahan."
+  echo "✅ Backup dikembalikan."
   exit 1
 fi
 
