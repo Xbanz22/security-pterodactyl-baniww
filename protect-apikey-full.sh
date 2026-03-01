@@ -7,18 +7,18 @@
 # ── Non-interactive mode ──────────────────────────────────────
 if [ ! -t 0 ]; then AUTOCONFIRM="y"; else AUTOCONFIRM=""; fi
 
-CONTROLLER_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Client/ApiKeyController.php"
-UI_PATH="/var/www/pterodactyl/resources/scripts/components/dashboard/AccountOverviewContainer.tsx"
+REMOTE_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Client/ApiKeyController.php"
 TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
-BACKUP_CONTROLLER="${CONTROLLER_PATH}.bak_${TIMESTAMP}"
-BACKUP_UI="${UI_PATH}.bak_${TIMESTAMP}"
+BACKUP_PATH="${REMOTE_PATH}.bak_${TIMESTAMP}"
 
 clear 2>/dev/null || true
 echo "════════════════════════════════════════════"
-echo "  🔐 FULL API KEY PROTECTION"
+echo "  🔐 PTERODACTYL API KEY PROTECTION"
 echo "  👑 By @baniwwwXD"
 echo "  🌐 github.com/Xbanz22"
 echo "════════════════════════════════════════════"
+echo ""
+echo "🚀 Memasang proteksi API Key..."
 echo ""
 
 # ── Cek root ──────────────────────────────────────────────────
@@ -27,47 +27,24 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# ── Cek file exist ────────────────────────────────────────────
-if [ ! -f "$CONTROLLER_PATH" ]; then
-  echo "❌ Controller tidak ditemukan: $CONTROLLER_PATH"
-  exit 1
-fi
-if [ ! -f "$UI_PATH" ]; then
-  echo "❌ UI file tidak ditemukan: $UI_PATH"
-  exit 1
-fi
-
-echo "✅ Controller : $CONTROLLER_PATH"
-echo "✅ UI file    : $UI_PATH"
-echo ""
-
 # ── Cek sudah terpasang ───────────────────────────────────────
-if grep -q "BANIWW_APIKEY_FULL" "$CONTROLLER_PATH" 2>/dev/null; then
+if grep -q "BANIWW_APIKEY_FULL" "$REMOTE_PATH" 2>/dev/null; then
   echo "⚠️  Proteksi sudah terpasang sebelumnya!"
   echo "ALREADY_INSTALLED"
   exit 0
 fi
 
-# ── Konfirmasi ────────────────────────────────────────────────
-if [ -z "$AUTOCONFIRM" ]; then
-  read -p "Continue with FULL protection? (y/n): " confirm
-else
-  confirm="y"
-  echo "Auto-confirm: y (non-interactive)"
+# ── Backup ────────────────────────────────────────────────────
+if [ -f "$REMOTE_PATH" ]; then
+  mv "$REMOTE_PATH" "$BACKUP_PATH"
+  echo "✅ Backup file lama → $(basename $BACKUP_PATH)"
 fi
-[ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && { echo "❌ Cancelled."; exit 1; }
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 1: Backend Protection
-# ═══════════════════════════════════════════════════════════════
-echo ""
-echo "════ STEP 1/2: Backend Protection ════"
+mkdir -p "$(dirname "$REMOTE_PATH")"
+chmod 755 "$(dirname "$REMOTE_PATH")"
 
-cp "$CONTROLLER_PATH" "$BACKUP_CONTROLLER"
-echo "✅ Backup: $(basename $BACKUP_CONTROLLER)"
-
-# Tulis controller — struktur SAMA PERSIS dengan asli, tambah proteksi
-cat > "$CONTROLLER_PATH" << 'PHPEOF'
+# ── Tulis controller baru ─────────────────────────────────────
+cat > "$REMOTE_PATH" << 'EOF'
 <?php
 
 // BANIWW_APIKEY_FULL: Protected by @baniwwwXD
@@ -77,7 +54,6 @@ namespace Pterodactyl\Http\Controllers\Api\Client;
 use Pterodactyl\Models\ApiKey;
 use Illuminate\Http\JsonResponse;
 use Pterodactyl\Facades\Activity;
-use Pterodactyl\Exceptions\DisplayException;
 use Pterodactyl\Http\Requests\Api\Client\ClientApiRequest;
 use Pterodactyl\Transformers\Api\Client\ApiKeyTransformer;
 use Pterodactyl\Http\Requests\Api\Client\Account\StoreApiKeyRequest;
@@ -85,17 +61,28 @@ use Pterodactyl\Http\Requests\Api\Client\Account\StoreApiKeyRequest;
 class ApiKeyController extends ClientApiController
 {
     /**
+     * 🔒 API Key Protection by @baniwwwXD
+     * Hanya super admin (ID 1) yang bisa akses API key
+     */
+    private function checkApiKeyAccess($request): void
+    {
+        $user = $request->user();
+
+        // Admin (user id = 1) bebas akses
+        if ($user->id === 1) {
+            return;
+        }
+
+        // Blokir semua user selain ID 1
+        abort(403, '🔒 Access Denied - API Key Protection By @baniwwwXD');
+    }
+
+    /**
      * Returns all the API keys that exist for the given client.
-     * PROTECTED: Only super admin (ID 1) can see keys.
      */
     public function index(ClientApiRequest $request): array
     {
-        // Block non-super-admin
-        if ($request->user()->id !== 1) {
-            return $this->fractal->collection(ApiKey::query()->whereRaw('1 = 0')->get())
-                ->transformWith($this->getTransformer(ApiKeyTransformer::class))
-                ->toArray();
-        }
+        $this->checkApiKeyAccess($request);
 
         return $this->fractal->collection($request->user()->apiKeys)
             ->transformWith($this->getTransformer(ApiKeyTransformer::class))
@@ -104,21 +91,17 @@ class ApiKeyController extends ClientApiController
 
     /**
      * Store a new API key for a user's account.
-     * PROTECTED: Only super admin (ID 1) can create keys.
      *
-     * @throws DisplayException
+     * @throws \Pterodactyl\Exceptions\DisplayException
      */
     public function store(StoreApiKeyRequest $request): array
     {
-        // Block non-super-admin
-        if ($request->user()->id !== 1) {
-            throw new DisplayException(
-                'ACCESS DENIED! API key creation is restricted to super administrators only. [Protected by @baniwwwXD]'
-            );
-        }
+        $this->checkApiKeyAccess($request);
 
         if ($request->user()->apiKeys->count() >= 25) {
-            throw new DisplayException('You have reached the account limit for number of API keys.');
+            throw new \Pterodactyl\Exceptions\DisplayException(
+                'You have reached the account limit for number of API keys.'
+            );
         }
 
         $token = $request->user()->createToken(
@@ -139,16 +122,10 @@ class ApiKeyController extends ClientApiController
 
     /**
      * Deletes a given API key.
-     * PROTECTED: Only super admin (ID 1) can delete keys.
      */
     public function delete(ClientApiRequest $request, string $identifier): JsonResponse
     {
-        // Block non-super-admin
-        if ($request->user()->id !== 1) {
-            throw new DisplayException(
-                'ACCESS DENIED! Only super administrator can delete API keys. [Protected by @baniwwwXD]'
-            );
-        }
+        $this->checkApiKeyAccess($request);
 
         /** @var ApiKey $key */
         $key = $request->user()->apiKeys()
@@ -165,98 +142,24 @@ class ApiKeyController extends ClientApiController
         return new JsonResponse([], JsonResponse::HTTP_NO_CONTENT);
     }
 }
-PHPEOF
+EOF
 
-chmod 644 "$CONTROLLER_PATH"
-
-# Verifikasi
-if grep -q "BANIWW_APIKEY_FULL" "$CONTROLLER_PATH"; then
-  echo "✅ Backend protection applied!"
-else
-  echo "❌ Gagal menulis controller! Mengembalikan backup..."
-  cp "$BACKUP_CONTROLLER" "$CONTROLLER_PATH"
-  exit 1
-fi
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 2: UI Protection
-# ═══════════════════════════════════════════════════════════════
-echo ""
-echo "════ STEP 2/2: UI Protection ════"
-
-cp "$UI_PATH" "$BACKUP_UI"
-echo "✅ Backup UI: $(basename $BACKUP_UI)"
-
-if grep -q "BANIWW_HIDDEN" "$UI_PATH" 2>/dev/null; then
-  echo "⚠️  UI sudah dimodifikasi, skip."
-else
-  sed -i '/API Keys/d' "$UI_PATH"
-  sed -i '/\/account\/api/d' "$UI_PATH"
-  sed -i '1s|^|// BANIWW_HIDDEN: API Key menu hidden by @baniwwwXD\n|' "$UI_PATH"
-
-  if grep -q "API Keys" "$UI_PATH"; then
-    echo "⚠️  Warning: Masih ada referensi API Keys."
-  else
-    echo "✅ UI modified!"
-  fi
-fi
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 3: Build Production
-# ═══════════════════════════════════════════════════════════════
-echo ""
-echo "🔨 Building production assets (3-7 menit)..."
-cd /var/www/pterodactyl || { echo "❌ Gagal masuk direktori"; exit 1; }
-
-if [ ! -d "node_modules" ]; then
-  echo "📦 Installing dependencies..."
-  npm install --silent 2>/dev/null || yarn install --silent 2>/dev/null
-fi
-
-if command -v yarn &>/dev/null; then
-  yarn build:production 2>&1
-else
-  npm run build:production 2>&1
-fi
-
-BUILD_EXIT=$?
-if [ $BUILD_EXIT -ne 0 ]; then
-  echo "❌ Build gagal! Mengembalikan semua backup..."
-  cp "$BACKUP_CONTROLLER" "$CONTROLLER_PATH"
-  cp "$BACKUP_UI" "$UI_PATH"
-  echo "✅ Backup dikembalikan."
-  exit 1
-fi
-
-echo "✅ Build complete!"
-
-# ── Clear cache ───────────────────────────────────────────────
-echo ""
-echo "🔄 Clearing cache..."
-php artisan config:clear > /dev/null 2>&1
-php artisan cache:clear > /dev/null 2>&1
-php artisan view:clear > /dev/null 2>&1
-php artisan route:clear > /dev/null 2>&1
-php artisan queue:restart > /dev/null 2>&1
-echo "✅ Cache cleared!"
+chmod 644 "$REMOTE_PATH"
 
 echo ""
 echo "════════════════════════════════════════════"
-echo "  ✅ FULL API KEY PROTECTION INSTALLED!"
+echo "  ✅ PROTEKSI BERHASIL DIPASANG!"
 echo "════════════════════════════════════════════"
 echo ""
-echo "✅ Backend : Hanya user ID 1 bisa buat/lihat/hapus API key"
-echo "✅ Frontend: Menu API Keys disembunyikan dari UI"
+echo "📂 Lokasi : $REMOTE_PATH"
+echo "🗂️  Backup : $(basename $BACKUP_PATH)"
 echo ""
-echo "📁 Backup:"
-echo "   Controller : $(basename $BACKUP_CONTROLLER)"
-echo "   UI         : $(basename $BACKUP_UI)"
+echo "🔒 Aturan Akses:"
+echo "   • Admin (ID 1) → Full Access ke API Key"
+echo "   • User biasa   → 403 Access Denied"
 echo ""
-echo "🔓 Untuk restore:"
-echo "   cp $BACKUP_CONTROLLER $CONTROLLER_PATH"
-echo "   cp $BACKUP_UI $UI_PATH"
-echo "   cd /var/www/pterodactyl && npm run build:production"
+echo "💡 Untuk uninstall, restore dari backup:"
+echo "   mv $BACKUP_PATH $REMOTE_PATH"
 echo ""
-echo "🎯 Security Level: MAXIMUM 🔥"
 echo "🔥 By @baniwwwXD"
 echo "════════════════════════════════════════════"
