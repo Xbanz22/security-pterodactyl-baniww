@@ -131,7 +131,8 @@ while i < len(lines):
         indent = len(block[0]) - len(block[0].lstrip())
         pad    = " " * indent
 
-        output.append(f"{pad}@if(Auth::user()->id === 1) {{-- BANIWW_DYNAMIC_SIDEBAR --}}")
+        marker = "{{-- BANIWW_DYNAMIC_SIDEBAR --}}"
+        output.append(f"{pad}@if(Auth::user()->id === 1) {marker}")
         output.extend(block)
         output.append(f"{pad}@endif")
         continue
