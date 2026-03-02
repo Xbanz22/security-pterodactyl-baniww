@@ -149,10 +149,24 @@ echo ""
 echo "🔨 [3/3] Building production (5-10 menit)..."
 cd /var/www/pterodactyl
 
-if command -v yarn &>/dev/null; then
-  yarn build:production 2>&1
+# Load nvm/node path
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+export PATH="$PATH:/usr/local/bin:/usr/bin:/root/.nvm/versions/node/$(ls /root/.nvm/versions/node 2>/dev/null | tail -1)/bin"
+
+# Cari yarn/npm
+YARN_BIN=$(which yarn 2>/dev/null || ls /root/.nvm/versions/node/*/bin/yarn 2>/dev/null | tail -1)
+NPM_BIN=$(which npm 2>/dev/null || ls /root/.nvm/versions/node/*/bin/npm 2>/dev/null | tail -1)
+
+if [ -n "$YARN_BIN" ]; then
+  echo "📦 Menggunakan yarn: $YARN_BIN"
+  $YARN_BIN build:production 2>&1
+elif [ -n "$NPM_BIN" ]; then
+  echo "📦 Menggunakan npm: $NPM_BIN"
+  $NPM_BIN run build:production 2>&1
 else
-  npm run build:production 2>&1
+  echo "❌ yarn/npm tidak ditemukan!"
+  exit 1
 fi
 
 BUILD_EXIT=$?
