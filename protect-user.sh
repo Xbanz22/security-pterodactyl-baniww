@@ -3,28 +3,32 @@
 REMOTE_PATH="/var/www/pterodactyl/app/Http/Controllers/Admin/UserController.php"
 TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
 BACKUP_PATH="${REMOTE_PATH}.bak_${TIMESTAMP}"
+MARKER="BANIWW_USER"
 
 clear
 echo "════════════════════════════════════════════"
 echo "  🛡️  PTERODACTYL USER PROTECTION"
+echo "  📦 by @baniwwwXD | baniwwDeveloper"
 echo "════════════════════════════════════════════"
 echo ""
-echo "📦 Script by: @baniwwwXD"
-echo "🌐 GitHub: github.com/Xbanzz22"
-echo ""
-echo "🚀 Memasang proteksi User Management..."
-echo ""
 
+# Cek sudah terpasang
+if grep -q "$MARKER" "$REMOTE_PATH" 2>/dev/null; then
+  echo "✅ ALREADY_INSTALLED — Proteksi sudah terpasang!"
+  exit 0
+fi
+
+# Backup
 if [ -f "$REMOTE_PATH" ]; then
-  mv "$REMOTE_PATH" "$BACKUP_PATH"
-  echo "✅ Backup file lama → $BACKUP_PATH"
+  cp "$REMOTE_PATH" "$BACKUP_PATH"
+  echo "✅ Backup → $BACKUP_PATH"
 fi
 
 mkdir -p "$(dirname "$REMOTE_PATH")"
-chmod 755 "$(dirname "$REMOTE_PATH")"
 
-cat > "$REMOTE_PATH" <<'EOF'
+cat > "$REMOTE_PATH" << 'PHPEOF'
 <?php
+// BANIWW_USER
 
 namespace Pterodactyl\Http\Controllers\Admin;
 
@@ -52,9 +56,6 @@ class UserController extends Controller
 {
     use AvailableLanguages;
 
-    /**
-     * UserController constructor.
-     */
     public function __construct(
         protected AlertsMessageBag $alert,
         protected UserCreationService $creationService,
@@ -63,12 +64,8 @@ class UserController extends Controller
         protected UserUpdateService $updateService,
         protected UserRepositoryInterface $repository,
         protected ViewFactory $view
-    ) {
-    }
+    ) {}
 
-    /**
-     * Display user index page.
-     */
     public function index(Request $request): View
     {
         $users = QueryBuilder::for(
@@ -86,9 +83,6 @@ class UserController extends Controller
         return $this->view->make('admin.users.index', ['users' => $users]);
     }
 
-    /**
-     * Display new user page.
-     */
     public function create(): View
     {
         return $this->view->make('admin.users.new', [
@@ -96,9 +90,6 @@ class UserController extends Controller
         ]);
     }
 
-    /**
-     * Display user view page.
-     */
     public function view(User $user): View
     {
         return $this->view->make('admin.users.view', [
@@ -107,17 +98,11 @@ class UserController extends Controller
         ]);
     }
 
-    /**
-     * Delete a user from the system.
-     *
-     * @throws Exception
-     * @throws DisplayException
-     */
     public function delete(Request $request, User $user): RedirectResponse
     {
-        // 🔒 User Protection: Only Super Admin (ID 1) can delete users
+        // 🔒 BANIWW: Only ID 1 can delete users
         if ($request->user()->id !== 1) {
-            throw new DisplayException('🔒 NGAPAIN LO DISINI KONTOL');
+            throw new DisplayException('🔒 Akses ditolak! Hanya Super Admin yang bisa menghapus user.');
         }
 
         if ($request->user()->id === $user->id) {
@@ -125,77 +110,83 @@ class UserController extends Controller
         }
 
         $this->deletionService->handle($user);
-
         return redirect()->route('admin.users');
     }
 
-    /**
-     * Create a user.
-     *
-     * @throws Exception
-     * @throws Throwable
-     */
     public function store(NewUserFormRequest $request): RedirectResponse
     {
-        $user = $this->creationService->handle($request->normalize());
+        // 🔒 BANIWW: Only ID 1 can create admin users
+        $data = $request->normalize();
+
+        if ($request->user()->id !== 1) {
+            // Force root_admin = false untuk selain ID 1
+            $data['root_admin'] = false;
+        }
+
+        // 🔒 BANIWW: Blokir total kalau selain ID 1 coba buat admin
+        if (isset($data['root_admin']) && $data['root_admin'] && $request->user()->id !== 1) {
+            throw new DisplayException('🔒 Akses ditolak! Hanya Super Admin yang bisa membuat akun Admin.');
+        }
+
+        $user = $this->creationService->handle($data);
         $this->alert->success($this->translator->get('admin/user.notices.account_created'))->flash();
 
         return redirect()->route('admin.users.view', $user->id);
     }
 
-    /**
-     * Update a user on the system.
-     *
-     * @throws DisplayException
-     */
     public function update(UserFormRequest $request, User $user): RedirectResponse
     {
-        // 🔒 User Protection: Protect sensitive fields from modification
-        $restrictedFields = ['email', 'first_name', 'last_name', 'password'];
+        $data = $request->normalize();
 
-        foreach ($restrictedFields as $field) {
-            if ($request->filled($field) && $request->user()->id !== 1) {
-                throw new DisplayException('🔒 PUNYA GITU LOH KONTOL JANGAN DIUBAH UBAH');
+        // 🔒 BANIWW: Blokir promote admin selain ID 1
+        if ($request->user()->id !== 1) {
+            // Tidak boleh promote jadi admin
+            if (!empty($data['root_admin'])) {
+                throw new DisplayException('🔒 Akses ditolak! Hanya Super Admin yang bisa mengubah status Admin.');
             }
-        }
 
-        // Prevent downgrading admin privileges
-        if ($user->root_admin && $request->user()->id !== 1) {
-            throw new DisplayException('🔒 PUNYA GITU LOH KONTOL JANGAN DIUBAH UBAH');
+            // Tidak boleh edit field sensitif user lain
+            $restrictedFields = ['email', 'password', 'root_admin'];
+            foreach ($restrictedFields as $field) {
+                if ($request->filled($field) && $user->id !== $request->user()->id) {
+                    throw new DisplayException('🔒 Akses ditolak! Kamu tidak bisa mengubah data user lain.');
+                }
+            }
+
+            // Tidak boleh edit user yang sudah admin
+            if ($user->root_admin) {
+                throw new DisplayException('🔒 Akses ditolak! Kamu tidak bisa mengedit akun Admin.');
+            }
+
+            // Paksa root_admin tetap false
+            $data['root_admin'] = false;
         }
 
         $this->updateService
             ->setUserLevel(User::USER_LEVEL_ADMIN)
-            ->handle($user, $request->normalize());
+            ->handle($user, $data);
 
         $this->alert->success(trans('admin/user.notices.account_updated'))->flash();
-
         return redirect()->route('admin.users.view', $user->id);
     }
 
-    /**
-     * Get a JSON response of users on the system.
-     */
     public function json(Request $request): Model|Collection
     {
         $users = QueryBuilder::for(User::query())->allowedFilters(['email'])->paginate(25);
 
-        // Handle single user requests.
         if ($request->query('user_id')) {
             $user = User::query()->findOrFail($request->input('user_id'));
             $user->md5 = md5(strtolower($user->email));
-
             return $user;
         }
 
         return $users->map(function ($item) {
             $item->md5 = md5(strtolower($item->email));
-
             return $item;
         });
     }
 }
-EOF
+PHPEOF
 
 chmod 644 "$REMOTE_PATH"
 
@@ -204,20 +195,14 @@ echo "════════════════════════�
 echo "  ✅ PROTEKSI BERHASIL DIPASANG!"
 echo "════════════════════════════════════════════"
 echo ""
-echo "📂 Lokasi: $REMOTE_PATH"
+echo "📂 File : $REMOTE_PATH"
 echo "🗂️ Backup: $BACKUP_PATH"
 echo ""
-echo "🔒 Aturan Akses:"
-echo "   • Super Admin (ID 1) → Full control user management"
-echo "   • Admin lain → Tidak bisa delete/edit user lain"
-echo ""
-echo "🛡️ Field yang dilindungi:"
-echo "   • Email"
-echo "   • First Name / Last Name"
-echo "   • Password"
-echo "   • Admin Privileges"
-echo ""
-echo "💡 Untuk uninstall, restore dari backup:"
-echo "   mv $BACKUP_PATH $REMOTE_PATH"
+echo "🔒 Aturan Proteksi:"
+echo "   ✅ ID 1  → Full control"
+echo "   ❌ Admin lain → Tidak bisa:"
+echo "      • Buat/promote user jadi Admin"
+echo "      • Edit/hapus user lain"
+echo "      • Ubah password/email user lain"
 echo ""
 echo "════════════════════════════════════════════"
