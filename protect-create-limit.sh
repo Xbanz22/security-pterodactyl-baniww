@@ -1,10 +1,5 @@
 #!/bin/bash
 
-# Versi Pterodactyl ini punya fungsi create server di:
-# - Api/Application/Servers/ServerController.php (via API)
-# - ServersController.php tidak punya store(), pakai route lain
-# Jadi kita patch API Application Controller saja
-
 API_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Application/Servers/ServerController.php"
 TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
 MARKER="BANIWW_CREATELIMIT"
@@ -22,67 +17,81 @@ if grep -q "$MARKER" "$API_PATH" 2>/dev/null; then
 fi
 
 if [ ! -f "$API_PATH" ]; then
-  echo "❌ ERROR: File tidak ditemukan di $API_PATH"
-  echo "   Coba cari manual:"
-  echo "   find /var/www/pterodactyl -name 'ServerController.php' | head -5"
+  echo "❌ File tidak ditemukan: $API_PATH"
+  echo "   Cari manual: find /var/www/pterodactyl -name 'ServerController.php'"
   exit 1
 fi
 
 cp "$API_PATH" "${API_PATH}.bak_${TIMESTAMP}"
 echo "✅ Backup → ${API_PATH}.bak_${TIMESTAMP}"
 
-# ─── Deteksi dan inject ───────────────────────────────────────
+FUNCS=$(grep -o 'public function [a-zA-Z]*' "$API_PATH" | tr '\n' ', ')
+echo "📋 Fungsi: $FUNCS"
+
+# ─── Tulis guard PHP ke file terpisah ────────────────────────
+cat > /tmp/createlimit_guard.txt << 'GUARDEOF'
+
+        // 🔒 BANIWW_CREATELIMIT: Blokir unlimited (0) saat create server via API
+        $cm = (int) ($request->input('limits.memory') ?? $request->input('memory') ?? 1);
+        $cd = (int) ($request->input('limits.disk')   ?? $request->input('disk')   ?? 1);
+        $cc = (int) ($request->input('limits.cpu')    ?? $request->input('cpu')    ?? 1);
+
+        if ($cm <= 0)    { throw new \Pterodactyl\Exceptions\DisplayException('Memory tidak boleh unlimited (0). Wajib 128-16384 MB.'); }
+        if ($cd <= 0)    { throw new \Pterodactyl\Exceptions\DisplayException('Disk tidak boleh unlimited (0). Wajib 512-102400 MB.'); }
+        if ($cc <= 0)    { throw new \Pterodactyl\Exceptions\DisplayException('CPU tidak boleh unlimited (0). Wajib 10-400%.'); }
+        if ($cm > 16384) { throw new \Pterodactyl\Exceptions\DisplayException('Memory terlalu besar. Maksimal 16384 MB.'); }
+        if ($cd > 102400){ throw new \Pterodactyl\Exceptions\DisplayException('Disk terlalu besar. Maksimal 102400 MB.'); }
+        if ($cc > 400)   { throw new \Pterodactyl\Exceptions\DisplayException('CPU terlalu besar. Maksimal 400%.'); }
+GUARDEOF
+
+# ─── Inject via Python — baca guard dari file ─────────────────
 python3 << PYEOF
 import re, sys
 
-filepath = "$API_PATH"
+filepath  = "$API_PATH"
+guardfile = "/tmp/createlimit_guard.txt"
 
 with open(filepath, 'r') as f:
     content = f.read()
 
-# Tampil semua fungsi dulu untuk debug
+with open(guardfile, 'r') as f:
+    guard = f.read()
+
+if 'BANIWW_CREATELIMIT' in content:
+    print("✅ ALREADY_INSTALLED")
+    sys.exit(0)
+
+# Deteksi fungsi target
 funcs = re.findall(r'public function (\w+)\(', content)
 print("📋 Fungsi: " + ", ".join(funcs))
 
-# Cari fungsi store atau create
 target = None
-for fn in ['store', 'create', 'index']:
-    if fn in funcs and fn != 'index':
+for fn in ['store', 'create']:
+    if fn in funcs:
         target = fn
         break
 
 if not target:
-    # Kalau tidak ada, coba cari fungsi pertama setelah __construct
-    for fn in funcs:
-        if fn != '__construct':
-            target = fn
-            break
-
-if not target:
-    print("❌ Tidak ada fungsi yang bisa di-inject.")
+    print("❌ Fungsi store/create tidak ditemukan. Tersedia: " + ", ".join(funcs))
     sys.exit(1)
 
-print(f"✅ Target fungsi: {target}()")
+print(f"✅ Target: {target}()")
 
-guard = r"""
-        // 🔒 BANIWW_CREATELIMIT: Blokir unlimited (0) saat create server via API
-        $_m = (int) (data_get($this->request->input(), 'limits.memory') ?? $this->request->input('memory') ?? $request->input('limits.memory') ?? $request->input('memory') ?? 1);
-        $_d = (int) (data_get($this->request->input(), 'limits.disk')   ?? $this->request->input('disk')   ?? $request->input('limits.disk')   ?? $request->input('disk')   ?? 1);
-        $_c = (int) (data_get($this->request->input(), 'limits.cpu')    ?? $this->request->input('cpu')    ?? $request->input('limits.cpu')    ?? $request->input('cpu')    ?? 1);
-        if ($_m <= 0)    throw new \Pterodactyl\Exceptions\DisplayException('🔒 Memory tidak boleh unlimited (0). Wajib antara 128-16384 MB.');
-        if ($_d <= 0)    throw new \Pterodactyl\Exceptions\DisplayException('🔒 Disk tidak boleh unlimited (0). Wajib antara 512-102400 MB.');
-        if ($_c <= 0)    throw new \Pterodactyl\Exceptions\DisplayException('🔒 CPU tidak boleh unlimited (0). Wajib antara 10-400%.');
-        if ($_m > 16384) throw new \Pterodactyl\Exceptions\DisplayException('🔒 Memory terlalu besar. Maksimal 16384 MB.');
-        if ($_d > 102400)throw new \Pterodactyl\Exceptions\DisplayException('🔒 Disk terlalu besar. Maksimal 102400 MB.');
-        if ($_c > 400)   throw new \Pterodactyl\Exceptions\DisplayException('🔒 CPU terlalu besar. Maksimal 400%.');
-"""
-
-pattern = rf'(public function {target}\([^)]*\)[^{{]*\{{)'
-new_content = re.sub(pattern, r'\1' + guard, content, count=1, flags=re.DOTALL)
-
-if new_content == content:
-    print(f"❌ Gagal inject ke {target}()")
+# Cari posisi fungsi target pakai string find, bukan regex
+marker_str = f'public function {target}('
+idx = content.find(marker_str)
+if idx == -1:
+    print(f"❌ {target}() tidak ditemukan dalam file")
     sys.exit(1)
+
+# Cari { pertama setelah deklarasi fungsi
+brace_idx = content.find('{', idx)
+if brace_idx == -1:
+    print("❌ Opening brace tidak ditemukan")
+    sys.exit(1)
+
+# Inject guard setelah {
+new_content = content[:brace_idx+1] + guard + content[brace_idx+1:]
 
 with open(filepath, 'w') as f:
     f.write(new_content)
@@ -94,15 +103,16 @@ RESULT=$?
 if [ $RESULT -ne 0 ]; then
   echo "❌ Gagal inject. Restore backup..."
   cp "${API_PATH}.bak_${TIMESTAMP}" "$API_PATH"
-  echo "✅ Backup dikembalikan."
+  rm -f /tmp/createlimit_guard.txt
   exit 1
 fi
+
+rm -f /tmp/createlimit_guard.txt
 
 echo ""
 echo "🔄 Clear cache Laravel..."
 cd /var/www/pterodactyl && php artisan optimize:clear > /dev/null 2>&1
 echo "✅ Cache cleared."
-
 chmod 644 "$API_PATH"
 
 echo ""
@@ -110,13 +120,10 @@ echo "════════════════════════�
 echo "  ✅ PROTEKSI BERHASIL DIPASANG!"
 echo "════════════════════════════════════════════"
 echo ""
-echo "📂 File  : $API_PATH"
-echo "🗂️ Backup: ${API_PATH}.bak_${TIMESTAMP}"
-echo ""
-echo "🔒 Aturan:"
-echo "   ❌ Memory/Disk/CPU = 0 (unlimited) → DIBLOKIR via API"
+echo "🔒 Aturan Create Server (via API):"
+echo "   ❌ Memory/Disk/CPU = 0 (unlimited) → DIBLOKIR"
 echo "   🧠 Memory  : 128 - 16.384 MB"
 echo "   💾 Disk    : 512 - 102.400 MB"
 echo "   ⚙️ CPU     : 10 - 400%"
 echo ""
-echo "════════════════════════════════════════════" 
+echo "════════════════════════════════════════════"
