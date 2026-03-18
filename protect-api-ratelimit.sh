@@ -1,6 +1,7 @@
 #!/bin/bash
 
 MARKER_FILE="/etc/nginx/pterodactyl-ratelimit.conf"
+NGINX_MAIN="/etc/nginx/nginx.conf"
 TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
 
 clear
@@ -20,100 +21,96 @@ if [ -f "$MARKER_FILE" ]; then
   exit 0
 fi
 
-# Deteksi config nginx Pterodactyl
-NGINX_CONF=""
-for f in \
-  /etc/nginx/sites-enabled/pterodactyl.conf \
-  /etc/nginx/sites-enabled/default \
-  /etc/nginx/conf.d/pterodactyl.conf \
-  /etc/nginx/conf.d/default.conf; do
-  if [ -f "$f" ]; then
-    NGINX_CONF="$f"
-    break
-  fi
-done
+# ─── Backup nginx.conf utama ──────────────────────────────────
+cp "$NGINX_MAIN" "${NGINX_MAIN}.bak_${TIMESTAMP}"
+echo "✅ Backup nginx.conf → ${NGINX_MAIN}.bak_${TIMESTAMP}"
 
-if [ -z "$NGINX_CONF" ]; then
-  echo "❌ Config nginx Pterodactyl tidak ditemukan!"
-  echo "   Cek manual: ls /etc/nginx/sites-enabled/"
-  exit 1
-fi
-
-echo "✅ Config nginx: $NGINX_CONF"
-
-NGINX_BACKUP="${NGINX_CONF}.bak_${TIMESTAMP}"
-cp "$NGINX_CONF" "$NGINX_BACKUP"
-echo "✅ Backup nginx → $NGINX_BACKUP"
-
-# Buat file rate limit zones
+# ─── Buat file zone terpisah ──────────────────────────────────
 cat > "$MARKER_FILE" << 'NGINXEOF'
-# ════════════════════════════════════════════════════════
-# 🛡️ PTERODACTYL API RATE LIMIT — by @baniwwwXD
-# ════════════════════════════════════════════════════════
+# 🛡️ PTERODACTYL API RATE LIMIT — by @baniwwwXD baniwwDeveloper
+# pterodactyl-ratelimit
 
-# Login endpoint — anti bruteforce (5 req/menit per IP)
+# Login — anti bruteforce (5 req/menit)
 limit_req_zone $binary_remote_addr zone=ptero_login:10m rate=5r/m;
 
-# Client API — anti flood user (30 req/menit per IP)
+# Client API — anti flood (30 req/menit)
 limit_req_zone $binary_remote_addr zone=ptero_client:10m rate=30r/m;
 
-# Application API — untuk bot/admin (60 req/menit per IP)
+# Application API — bot/admin (60 req/menit)
 limit_req_zone $binary_remote_addr zone=ptero_app:10m rate=60r/m;
 
-# Return 429 kalau kena limit
 limit_req_status 429;
 NGINXEOF
 
 echo "✅ Rate limit zones dibuat → $MARKER_FILE"
 
-# Inject include ke nginx config kalau belum ada
-if grep -q "pterodactyl-ratelimit.conf" "$NGINX_CONF"; then
-  echo "⚠️  Include sudah ada di nginx config, skip."
-else
-  sed -i "1s|^|include /etc/nginx/pterodactyl-ratelimit.conf;\n|" "$NGINX_CONF"
-  echo "✅ Include ditambahkan ke $NGINX_CONF"
+# ─── Inject include ke dalam http { } block di nginx.conf ─────
+# Ini cara yang benar — inject di dalam http block, bukan di baris pertama
+python3 << 'PYEOF'
+import re, sys
+
+filepath = "/etc/nginx/nginx.conf"
+
+with open(filepath, 'r') as f:
+    content = f.read()
+
+# Cek sudah ada
+if 'pterodactyl-ratelimit.conf' in content:
+    print("⚠️ Include sudah ada, skip.")
+    sys.exit(0)
+
+# Inject setelah baris pembuka http {
+pattern = r'(http\s*\{)'
+replacement = r'\1\n    include /etc/nginx/pterodactyl-ratelimit.conf;'
+
+new_content = re.sub(pattern, replacement, content, count=1)
+
+if new_content == content:
+    print("❌ Gagal inject ke http block.")
+    sys.exit(1)
+
+with open(filepath, 'w') as f:
+    f.write(new_content)
+
+print("✅ Include berhasil ditambahkan ke http { } block nginx.conf")
+PYEOF
+
+RESULT=$?
+if [ $RESULT -ne 0 ]; then
+  echo "❌ Gagal inject. Rollback..."
+  cp "${NGINX_MAIN}.bak_${TIMESTAMP}" "$NGINX_MAIN"
+  rm -f "$MARKER_FILE"
+  exit 1
 fi
 
-# Inject limit_req ke location blocks via Python
-python3 << PYEOF
+# ─── Deteksi config Pterodactyl dan inject limit_req ─────────
+PTERO_CONF=""
+for f in \
+  /etc/nginx/sites-enabled/pterodactyl.conf \
+  /etc/nginx/sites-available/pterodactyl.conf \
+  /etc/nginx/conf.d/pterodactyl.conf; do
+  if [ -f "$f" ]; then
+    PTERO_CONF="$f"
+    break
+  fi
+done
+
+if [ -n "$PTERO_CONF" ]; then
+  echo "✅ Config Pterodactyl ditemukan: $PTERO_CONF"
+  cp "$PTERO_CONF" "${PTERO_CONF}.bak_${TIMESTAMP}"
+
+  python3 << PYEOF2
 import re
 
-filepath = "$NGINX_CONF"
+filepath = "$PTERO_CONF"
 
 with open(filepath, 'r') as f:
     content = f.read()
 
 changes = 0
 
-# 1. Login
-if re.search(r'location\s+[~*]*\s*/auth', content) and 'ptero_login' not in content:
-    content = re.sub(
-        r'(location\s+[~*]*\s*/auth[^{]*\{)',
-        r'\1\n        limit_req zone=ptero_login burst=3 nodelay;',
-        content, count=1
-    )
-    changes += 1
-
-# 2. Client API
-if re.search(r'location\s+[~*]*\s*/api/client', content) and 'ptero_client' not in content:
-    content = re.sub(
-        r'(location\s+[~*]*\s*/api/client[^{]*\{)',
-        r'\1\n        limit_req zone=ptero_client burst=10 nodelay;',
-        content, count=1
-    )
-    changes += 1
-
-# 3. Application API
-if re.search(r'location\s+[~*]*\s*/api/application', content) and 'ptero_app' not in content:
-    content = re.sub(
-        r'(location\s+[~*]*\s*/api/application[^{]*\{)',
-        r'\1\n        limit_req zone=ptero_app burst=20 nodelay;',
-        content, count=1
-    )
-    changes += 1
-
-# Fallback: inject ke location / kalau tidak ada location spesifik
-if changes == 0 and 'ptero_client' not in content:
+# Inject ke location / (main)
+if 'ptero_client' not in content:
     content = re.sub(
         r'(location\s+/\s*\{)',
         r'\1\n        limit_req zone=ptero_client burst=20 nodelay;',
@@ -124,18 +121,20 @@ if changes == 0 and 'ptero_client' not in content:
 with open(filepath, 'w') as f:
     f.write(content)
 
-print(f"✅ {changes} location block diupdate.")
-PYEOF
+print(f"✅ {changes} location block diupdate di {filepath}")
+PYEOF2
 
-# Test nginx
+fi
+
+# ─── Test & reload nginx ──────────────────────────────────────
 echo ""
 echo "🔄 Testing konfigurasi nginx..."
 nginx -t 2>&1
 
 if [ $? -ne 0 ]; then
-  echo ""
-  echo "❌ Konfigurasi nginx error! Rollback..."
-  cp "$NGINX_BACKUP" "$NGINX_CONF"
+  echo "❌ Nginx config error! Rollback..."
+  cp "${NGINX_MAIN}.bak_${TIMESTAMP}" "$NGINX_MAIN"
+  [ -n "$PTERO_CONF" ] && cp "${PTERO_CONF}.bak_${TIMESTAMP}" "$PTERO_CONF"
   rm -f "$MARKER_FILE"
   echo "✅ Rollback berhasil."
   exit 1
@@ -149,16 +148,12 @@ echo "════════════════════════�
 echo "  ✅ RATE LIMIT BERHASIL DIPASANG!"
 echo "════════════════════════════════════════════"
 echo ""
-echo "📂 Config : $MARKER_FILE"
-echo "📂 Nginx  : $NGINX_CONF"
-echo "🗂️ Backup : $NGINX_BACKUP"
+echo "📂 Zone file : $MARKER_FILE"
+echo "📂 nginx.conf: $NGINX_MAIN"
 echo ""
 echo "🔒 Rate Limit:"
 echo "   🔑 Login      : 5 req/menit  (anti bruteforce)"
 echo "   👤 Client API : 30 req/menit (anti flood)"
 echo "   🔧 App API    : 60 req/menit (bot/admin)"
-echo ""
-echo "⚠️  Kalau bot kamu kena 429, naikkan rate di:"
-echo "   $MARKER_FILE"
 echo ""
 echo "════════════════════════════════════════════"
