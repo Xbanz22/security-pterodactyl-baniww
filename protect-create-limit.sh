@@ -1,6 +1,7 @@
 #!/bin/bash
 
 REMOTE_PATH="/var/www/pterodactyl/app/Http/Controllers/Admin/ServersController.php"
+API_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Application/Servers/ServerController.php"
 TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
 BACKUP_PATH="${REMOTE_PATH}.bak_create_${TIMESTAMP}"
 MARKER="BANIWW_CREATELIMIT"
@@ -8,7 +9,7 @@ MARKER="BANIWW_CREATELIMIT"
 clear
 echo "════════════════════════════════════════════"
 echo "  🛡️  PTERODACTYL CREATE LIMIT PROTECTION"
-echo "  📦 by @baniwwwXD | baniwwDeveloper"
+echo "  by @baniwwwXD | baniwwDeveloper"
 echo "════════════════════════════════════════════"
 echo ""
 
@@ -25,68 +26,61 @@ fi
 cp "$REMOTE_PATH" "$BACKUP_PATH"
 echo "✅ Backup → $BACKUP_PATH"
 
+# ─── Deteksi nama fungsi yang tersedia ────────────────────────
 python3 << PYEOF
-import re
+import re, sys
 
 filepath = "$REMOTE_PATH"
 
 with open(filepath, 'r') as f:
     content = f.read()
 
-# Cek fungsi store() ada
-if 'public function store(' not in content:
-    print("❌ Fungsi store() tidak ditemukan.")
-    exit(1)
+# Cari semua fungsi public yang ada
+funcs = re.findall(r'public function (\w+)\(', content)
+print("📋 Fungsi yang ditemukan: " + ", ".join(funcs))
 
-guard = '''
+# Coba berbagai kemungkinan nama fungsi create di Pterodactyl
+target_funcs = ['store', 'create', 'processCreate', 'postBasic']
+found = None
+for fn in target_funcs:
+    if fn in funcs:
+        found = fn
+        print(f"✅ Target fungsi ditemukan: {fn}()")
+        break
+
+if not found:
+    print(f"❌ Tidak ada fungsi create yang dikenal. Fungsi tersedia: {', '.join(funcs)}")
+    sys.exit(1)
+
+guard = f'''
         // 🔒 BANIWW_CREATELIMIT: Blokir unlimited (0) saat CREATE server
-        \$cMemory = (int) \$request->input('memory', 1);
-        \$cDisk   = (int) \$request->input('disk', 1);
-        \$cCpu    = (int) \$request->input('cpu', 1);
-        \$cBackup = (int) \$request->input('backup_limit', 0);
-        \$cDb     = (int) \$request->input('database_limit', 0);
+        $_mem  = (int) ($request->input('memory') ?? $request->input('limits.memory') ?? 1);
+        $_disk = (int) ($request->input('disk')   ?? $request->input('limits.disk')   ?? 1);
+        $_cpu  = (int) ($request->input('cpu')    ?? $request->input('limits.cpu')    ?? 1);
+        $_bak  = (int) ($request->input('backup_limit', 0));
+        $_db   = (int) ($request->input('database_limit', 0));
 
-        // Blokir unlimited (0) untuk resource utama
-        if (\$cMemory <= 0) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Memory tidak boleh unlimited (0). Wajib antara 128 - 16384 MB.');
-        }
-        if (\$cDisk <= 0) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Disk tidak boleh unlimited (0). Wajib antara 512 - 102400 MB.');
-        }
-        if (\$cCpu <= 0) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 CPU tidak boleh unlimited (0). Wajib antara 10 - 400%.');
-        }
-
-        // Blokir nilai terlalu besar
-        if (\$cMemory > 16384) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Memory terlalu besar. Maksimal 16384 MB (16 GB).');
-        }
-        if (\$cDisk > 102400) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Disk terlalu besar. Maksimal 102400 MB (100 GB).');
-        }
-        if (\$cCpu > 400) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 CPU terlalu besar. Maksimal 400%.');
-        }
-        if (\$cBackup > 10) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Backup slot maks 10.');
-        }
-        if (\$cDb > 10) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Database slot maks 10.');
-        }
+        if ($_mem <= 0)   throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Memory tidak boleh unlimited (0). Wajib antara 128 - 16384 MB.');
+        if ($_disk <= 0)  throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Disk tidak boleh unlimited (0). Wajib antara 512 - 102400 MB.');
+        if ($_cpu <= 0)   throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 CPU tidak boleh unlimited (0). Wajib antara 10 - 400%.');
+        if ($_mem > 16384)  throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Memory terlalu besar. Maksimal 16384 MB.');
+        if ($_disk > 102400) throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Disk terlalu besar. Maksimal 102400 MB.');
+        if ($_cpu > 400)  throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 CPU terlalu besar. Maksimal 400%.');
+        if ($_bak > 10)   throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Backup slot maks 10.');
+        if ($_db > 10)    throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Database slot maks 10.');
 '''
 
-# Inject ke fungsi store()
-pattern = r'(public function store\([^)]*\)[^{]*\{)'
-new_content = re.sub(pattern, r'\1' + guard, content, count=1, flags=re.DOTALL)
+pattern = rf'(public function {found}\([^)]*\)[^{{]*\{{)'
+new_content = re.sub(pattern, r'\\1' + guard, content, count=1, flags=re.DOTALL)
 
 if new_content == content:
-    print("❌ Gagal inject store() — pattern tidak cocok.")
-    exit(1)
+    print(f"❌ Gagal inject ke fungsi {found}()")
+    sys.exit(1)
 
 with open(filepath, 'w') as f:
     f.write(new_content)
 
-print("✅ Inject store() berhasil!")
+print(f"✅ Inject ke fungsi {found}() berhasil!")
 PYEOF
 
 RESULT=$?
@@ -97,64 +91,56 @@ if [ $RESULT -ne 0 ]; then
   exit 1
 fi
 
-# Patch juga API Application ServerController untuk blokir via API
-API_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Application/Servers/ServerController.php"
-
+# ─── Patch API Controller juga ────────────────────────────────
 if [ -f "$API_PATH" ] && ! grep -q "$MARKER" "$API_PATH" 2>/dev/null; then
   cp "$API_PATH" "${API_PATH}.bak_${TIMESTAMP}"
   echo "✅ Backup API Controller → ${API_PATH}.bak_${TIMESTAMP}"
 
   python3 << PYEOF2
-import re
+import re, sys
 
 filepath = "$API_PATH"
 
 with open(filepath, 'r') as f:
     content = f.read()
 
-if 'public function store(' not in content:
-    print("⚠️  store() tidak ditemukan di API Controller, skip.")
-    exit(0)
+funcs = re.findall(r'public function (\w+)\(', content)
+target_funcs = ['store', 'create', 'processCreate']
+found = None
+for fn in target_funcs:
+    if fn in funcs:
+        found = fn
+        break
+
+if not found:
+    print(f"⚠️  Fungsi create tidak ditemukan di API Controller, skip.")
+    sys.exit(0)
 
 guard = '''
-        // 🔒 BANIWW_CREATELIMIT: Blokir unlimited via API
-        \$apiMemory = (int) (\$request->input('limits.memory') ?? \$request->input('memory') ?? 1);
-        \$apiDisk   = (int) (\$request->input('limits.disk')   ?? \$request->input('disk')   ?? 1);
-        \$apiCpu    = (int) (\$request->input('limits.cpu')    ?? \$request->input('cpu')    ?? 1);
-
-        if (\$apiMemory <= 0) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Memory tidak boleh unlimited (0).');
-        }
-        if (\$apiDisk <= 0) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Disk tidak boleh unlimited (0).');
-        }
-        if (\$apiCpu <= 0) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 CPU tidak boleh unlimited (0).');
-        }
-        if (\$apiMemory > 16384) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Memory maks 16384 MB.');
-        }
-        if (\$apiDisk > 102400) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Disk maks 102400 MB.');
-        }
-        if (\$apiCpu > 400) {
-            throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 CPU maks 400%.');
-        }
+        // 🔒 BANIWW_CREATELIMIT
+        \$_am = (int) (\$request->input('limits.memory') ?? \$request->input('memory') ?? 1);
+        \$_ad = (int) (\$request->input('limits.disk')   ?? \$request->input('disk')   ?? 1);
+        \$_ac = (int) (\$request->input('limits.cpu')    ?? \$request->input('cpu')    ?? 1);
+        if (\$_am <= 0)  throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Memory tidak boleh unlimited.');
+        if (\$_ad <= 0)  throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Disk tidak boleh unlimited.');
+        if (\$_ac <= 0)  throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 CPU tidak boleh unlimited.');
+        if (\$_am > 16384)  throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Memory maks 16384 MB.');
+        if (\$_ad > 102400) throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 Disk maks 102400 MB.');
+        if (\$_ac > 400)    throw new \\Pterodactyl\\Exceptions\\DisplayException('🔒 CPU maks 400%.');
 '''
 
-pattern = r'(public function store\([^)]*\)[^{]*\{)'
-new_content = re.sub(pattern, r'\1' + guard, content, count=1, flags=re.DOTALL)
+pattern = rf'(public function {found}\([^)]*\)[^{{]*\{{)'
+new_content = re.sub(pattern, r'\\1' + guard, content, count=1, flags=re.DOTALL)
 
 if new_content == content:
-    print("⚠️  Gagal inject API Controller — skip.")
-    exit(0)
+    print(f"⚠️  Gagal inject API Controller, skip.")
+    sys.exit(0)
 
 with open(filepath, 'w') as f:
     f.write(new_content)
 
-print("✅ Inject API Controller berhasil!")
+print(f"✅ Inject API Controller ke {found}() berhasil!")
 PYEOF2
-
 fi
 
 echo ""
@@ -170,18 +156,13 @@ echo "  ✅ PROTEKSI BERHASIL DIPASANG!"
 echo "════════════════════════════════════════════"
 echo ""
 echo "📂 File  : $REMOTE_PATH"
-echo "📂 API   : $API_PATH"
 echo "🗂️ Backup: $BACKUP_PATH"
 echo ""
 echo "🔒 Aturan Create Server:"
 echo "   ❌ Memory/Disk/CPU = 0 (unlimited) → DIBLOKIR"
-echo "   ❌ Berlaku untuk panel admin DAN API (bot)"
-echo "   🧠 Memory  : Wajib 128 - 16.384 MB"
-echo "   💾 Disk    : Wajib 512 - 102.400 MB"
-echo "   ⚙️ CPU     : Wajib 10 - 400%"
-echo "   📦 Backup  : Maks 10 slot"
-echo "   🗄️ Database: Maks 10 slot"
-echo ""
-echo "💡 Edit nilai maks langsung di script ini jika perlu."
+echo "   ❌ Berlaku via panel admin DAN API (bot)"
+echo "   🧠 Memory  : 128 - 16.384 MB"
+echo "   💾 Disk    : 512 - 102.400 MB"
+echo "   ⚙️ CPU     : 10 - 400%"
 echo ""
 echo "════════════════════════════════════════════"
