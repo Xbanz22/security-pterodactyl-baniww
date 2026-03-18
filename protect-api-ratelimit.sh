@@ -40,8 +40,22 @@ if [ -z "$PTERO_CONF" ]; then
 fi
 
 echo "✅ Config ditemukan: $PTERO_CONF"
-cp "$PTERO_CONF" "${PTERO_CONF}.bak_${TIMESTAMP}"
-echo "✅ Backup → ${PTERO_CONF}.bak_${TIMESTAMP}"
+
+# ─── Pindahkan backup lama dari sites-enabled ke /tmp ────────
+# Nginx membaca SEMUA file di sites-enabled termasuk .bak → duplicate listen
+SITES_DIR=$(dirname "$PTERO_CONF")
+BAK_COUNT=$(ls "${SITES_DIR}"/*.bak_* 2>/dev/null | wc -l)
+if [ "$BAK_COUNT" -gt 0 ]; then
+  mkdir -p /tmp/nginx-bak-old
+  mv "${SITES_DIR}"/*.bak_* /tmp/nginx-bak-old/ 2>/dev/null
+  echo "✅ $BAK_COUNT file backup lama dipindah ke /tmp/nginx-bak-old/"
+fi
+
+# ─── Backup config aktif ──────────────────────────────────────
+# Simpan ke /tmp bukan ke sites-enabled supaya tidak terbaca nginx
+BACKUP_SAFE="/tmp/pterodactyl.conf.bak_${TIMESTAMP}"
+cp "$PTERO_CONF" "$BACKUP_SAFE"
+echo "✅ Backup → $BACKUP_SAFE"
 
 # ─── Buat file zone ───────────────────────────────────────────
 cat > "$MARKER_FILE" << 'NGINXEOF'
@@ -55,9 +69,7 @@ NGINXEOF
 
 echo "✅ Rate limit zones dibuat → $MARKER_FILE"
 
-# ─── Inject limit_req_zone ke dalam server {} block ──────────
-# Kita taruh zone definition di dalam server block pertama, BUKAN di http block
-# Ini cara yang aman untuk nginx setup seperti Pterodactyl
+# ─── Inject limit_req ke location / block di pterodactyl.conf ─
 python3 << PYEOF
 import re, sys
 
@@ -67,11 +79,9 @@ with open(filepath, 'r') as f:
     content = f.read()
 
 if 'ptero_client' in content:
-    print("⚠️ Rate limit sudah ada di config, skip.")
+    print("⚠️ limit_req sudah ada, skip.")
     sys.exit(0)
 
-# Inject limit_req ke location / block
-# Cari location / { yang paling awal
 if re.search(r'location\s+/\s*\{', content):
     content = re.sub(
         r'(location\s+/\s*\{)',
@@ -80,7 +90,6 @@ if re.search(r'location\s+/\s*\{', content):
     )
     print("✅ limit_req ditambahkan ke location / block")
 else:
-    # Fallback: inject setelah server_name
     content = re.sub(
         r'(server_name\s+[^;]+;)',
         r'\1\n    limit_req zone=ptero_client burst=20 nodelay;',
@@ -92,10 +101,9 @@ with open(filepath, 'w') as f:
     f.write(content)
 PYEOF
 
-# ─── Inject include zone ke nginx.conf di http block ─────────
+# ─── Inject include ke http block nginx.conf ──────────────────
 NGINX_MAIN="/etc/nginx/nginx.conf"
 if ! grep -q "pterodactyl-ratelimit.conf" "$NGINX_MAIN" 2>/dev/null; then
-  # Inject SETELAH baris "http {" saja
   sed -i '/^http {/a\    include /etc/nginx/pterodactyl-ratelimit.conf;' "$NGINX_MAIN"
   echo "✅ Include ditambahkan ke $NGINX_MAIN"
 else
@@ -109,9 +117,11 @@ nginx -t 2>&1
 
 if [ $? -ne 0 ]; then
   echo "❌ Nginx error! Rollback..."
-  cp "${PTERO_CONF}.bak_${TIMESTAMP}" "$PTERO_CONF"
-  sed -i '/pterodactyl-ratelimit.conf/d' "$NGINX_MAIN"
+  cp "$BACKUP_SAFE" "$PTERO_CONF"
+  sed -i '/pterodactyl-ratelimit.conf/d' "$NGINX_MAIN" 2>/dev/null
   rm -f "$MARKER_FILE"
+  # Kembalikan backup lama kalau ada
+  [ -d /tmp/nginx-bak-old ] && mv /tmp/nginx-bak-old/*.bak_* "$SITES_DIR/" 2>/dev/null
   echo "✅ Rollback berhasil."
   exit 1
 fi
@@ -128,5 +138,7 @@ echo "🔒 Rate Limit:"
 echo "   🔑 Login      : 5 req/menit  (anti bruteforce)"
 echo "   👤 Client API : 30 req/menit (anti flood)"
 echo "   🔧 App API    : 60 req/menit (bot/admin)"
+echo ""
+echo "💡 Backup lama nginx ada di /tmp/nginx-bak-old/"
 echo ""
 echo "════════════════════════════════════════════"
