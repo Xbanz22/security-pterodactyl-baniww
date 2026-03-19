@@ -1,13 +1,13 @@
 #!/bin/bash
-# Fix v2: perbaiki \n newline di Telegram + ip_info timeout + state init
+# Fix v3: ip_info retry + cache, jail name fix, wizard order fix
 
 CONFIG_FILE="/etc/pterodactyl-ddos-monitor.conf"
 MONITOR_SCRIPT="/usr/local/bin/ptero-ddos-monitor.sh"
 SERVICE_FILE="/etc/systemd/system/ptero-ddos-monitor.service"
 
 echo "════════════════════════════════════════════"
-echo "  🔧 FIX DDOS MONITOR v2"
-echo "  Fix: newline + ip_info + state init"
+echo "  🔧 FIX DDOS MONITOR v3"
+echo "  Fix: ip_info + jail name + wizard order"
 echo "  by @baniwwwXD | baniwwDeveloper"
 echo "════════════════════════════════════════════"
 echo ""
@@ -20,16 +20,20 @@ fi
 source "$CONFIG_FILE"
 echo "✅ Config: BOT_TOKEN=${BOT_TOKEN:0:10}... CHAT_ID=$CHAT_ID"
 
-apt-get install -y curl geoip-bin geoip-database iproute2 net-tools > /dev/null 2>&1
+apt-get install -y curl geoip-bin geoip-database iproute2 net-tools python3 > /dev/null 2>&1
 echo "✅ Dependency OK"
 
 systemctl stop ptero-ddos-monitor 2>/dev/null
 
 # Init state supaya tidak baca log lama
 mkdir -p /tmp/ptero-ddos-state
-wc -l < /var/log/syslog > /tmp/ptero-ddos-state/syslog_last 2>/dev/null || echo 0 > /tmp/ptero-ddos-state/syslog_last
-wc -l < /var/log/fail2ban.log > /tmp/ptero-ddos-state/f2b_last 2>/dev/null || echo 0 > /tmp/ptero-ddos-state/f2b_last
-echo "✅ State diinit (tidak baca log lama)"
+wc -l < /var/log/syslog      > /tmp/ptero-ddos-state/syslog_last  2>/dev/null || echo 0 > /tmp/ptero-ddos-state/syslog_last
+wc -l < /var/log/fail2ban.log > /tmp/ptero-ddos-state/f2b_last    2>/dev/null || echo 0 > /tmp/ptero-ddos-state/f2b_last
+echo "✅ State diinit"
+
+# Buat cache dir untuk ip_info
+mkdir -p /tmp/ptero-ip-cache
+echo "✅ IP cache dir dibuat"
 
 cat > "$MONITOR_SCRIPT" << 'MONEOF'
 #!/bin/bash
@@ -37,13 +41,13 @@ cat > "$MONITOR_SCRIPT" << 'MONEOF'
 source /etc/pterodactyl-ddos-monitor.conf
 
 STATE_DIR="/tmp/ptero-ddos-state"
-mkdir -p "$STATE_DIR"
+IP_CACHE="/tmp/ptero-ip-cache"
+mkdir -p "$STATE_DIR" "$IP_CACHE"
 ALERT_COOLDOWN=300
 
-# ─── Kirim Telegram — pakai printf supaya \n jadi newline beneran ───
+# ─── Kirim Telegram ───────────────────────────────────────────
 tg() {
   local text
-  # printf expand \n jadi newline beneran
   text=$(printf '%b' "$1")
   curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
     -d "chat_id=${CHAT_ID}" \
@@ -51,34 +55,72 @@ tg() {
     --data-urlencode "text=${text}" > /dev/null 2>&1
 }
 
-# ─── Info IP detail — timeout lebih panjang, fallback geoiplookup ───
+# ─── Info IP — cache + retry 3x + fallback geoip ─────────────
 ip_info() {
   local ip="$1"
+  local cache_file="${IP_CACHE}/$(echo "$ip" | tr '.' '_')"
+
+  # Gunakan cache kalau ada dan masih fresh (< 1 jam)
+  if [ -f "$cache_file" ]; then
+    local age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
+    if [ "$age" -lt 3600 ]; then
+      cat "$cache_file"
+      return
+    fi
+  fi
+
   local loc="Unknown" org="Unknown" rdns="No rDNS"
 
-  # Coba ip-api.com
-  local api
-  api=$(curl -s --max-time 5 "http://ip-api.com/json/${ip}?fields=country,regionName,city,isp,org,status" 2>/dev/null)
+  # Coba ip-api.com dengan retry 3x
+  for attempt in 1 2 3; do
+    local api
+    api=$(curl -s --max-time 8 --retry 2 \
+      "http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,as" 2>/dev/null)
 
-  if echo "$api" | grep -q '"status":"success"'; then
-    loc=$(echo "$api" | python3 -c "
+    if echo "$api" | grep -q '"status":"success"'; then
+      loc=$(echo "$api" | python3 -c "
 import sys,json
-d=json.load(sys.stdin)
-print(f\"{d.get('city','?')}, {d.get('regionName','?')}, {d.get('country','?')}\")" 2>/dev/null || echo "Unknown")
-    org=$(echo "$api" | python3 -c "
+try:
+  d=json.load(sys.stdin)
+  city=d.get('city','')
+  region=d.get('regionName','')
+  country=d.get('country','')
+  parts=[p for p in [city,region,country] if p]
+  print(', '.join(parts) if parts else 'Unknown')
+except: print('Unknown')
+" 2>/dev/null || echo "Unknown")
+
+      org=$(echo "$api" | python3 -c "
 import sys,json
-d=json.load(sys.stdin)
-print(d.get('org', d.get('isp','Unknown')))" 2>/dev/null || echo "Unknown")
-  elif command -v geoiplookup &>/dev/null; then
-    loc=$(geoiplookup "$ip" 2>/dev/null | grep "Country" | grep -oP ': \K.*' | head -1 || echo "Unknown")
+try:
+  d=json.load(sys.stdin)
+  print(d.get('org') or d.get('isp') or d.get('as') or 'Unknown')
+except: print('Unknown')
+" 2>/dev/null || echo "Unknown")
+      break
+    fi
+    sleep 1
+  done
+
+  # Fallback ke geoiplookup kalau masih Unknown
+  if [ "$loc" = "Unknown" ] && command -v geoiplookup &>/dev/null; then
+    local geo
+    geo=$(geoiplookup "$ip" 2>/dev/null | grep "Country" | grep -oP ': \K.*' | head -1)
+    [ -n "$geo" ] && loc="$geo"
   fi
 
   # Reverse DNS
-  rdns=$(host "$ip" 2>/dev/null | grep -oP 'pointer \K\S+' | sed 's/\.$//' | head -1 || echo "No rDNS")
+  rdns=$(host "$ip" 2>/dev/null | grep -oP 'pointer \K\S+' | sed 's/\.$//' | head -1 2>/dev/null || echo "No rDNS")
+  [ -z "$rdns" ] && rdns="No rDNS"
 
-  echo "${loc}|||${org}|||${rdns}"
+  local result="${loc}|||${org}|||${rdns}"
+
+  # Simpan ke cache
+  echo "$result" > "$cache_file"
+  echo "$result"
 }
 
+# ─── Helper ───────────────────────────────────────────────────
 on_cooldown() {
   local f="${STATE_DIR}/$(echo "$1" | tr '/:.' '_')"
   if [ -f "$f" ]; then
@@ -99,7 +141,7 @@ perm_ban() {
 }
 
 is_private() {
-  [[ "$1" =~ ^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]] && return 0
+  [[ "$1" =~ ^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1$|^$) ]] && return 0
   return 1
 }
 
@@ -116,8 +158,8 @@ check_connections() {
 
       local info loc org rdns auto_ban=""
       info=$(ip_info "$ip")
-      loc=$(echo "$info" | cut -d'|||' -f1)
-      org=$(echo "$info" | cut -d'|||' -f2)
+      loc=$(echo "$info"  | cut -d'|||' -f1)
+      org=$(echo "$info"  | cut -d'|||' -f2)
       rdns=$(echo "$info" | cut -d'|||' -f3)
 
       if [ "$count" -gt $((THRESHOLD * 3)) ]; then
@@ -134,20 +176,20 @@ check_nginx_flood() {
   local access_log="/var/log/nginx/access.log"
   [ ! -f "$access_log" ] && return
   local now; now=$(date '+%d/%m/%Y %H:%M:%S')
-  local half_threshold=$(( THRESHOLD / 2 ))
+  local half=$(( THRESHOLD / 2 ))
 
   tail -5000 "$access_log" 2>/dev/null | awk '{print $1}' | \
     sort | uniq -c | sort -rn | head -20 | \
     while read -r count ip; do
       is_private "$ip" && continue
-      [ "$count" -le "$half_threshold" ] && continue
+      [ "$count" -le "$half" ] && continue
       on_cooldown "nginx_${ip}" && continue
       set_cooldown "nginx_${ip}"
 
       local info loc org rdns auto_ban=""
       info=$(ip_info "$ip")
-      loc=$(echo "$info" | cut -d'|||' -f1)
-      org=$(echo "$info" | cut -d'|||' -f2)
+      loc=$(echo "$info"  | cut -d'|||' -f1)
+      org=$(echo "$info"  | cut -d'|||' -f2)
       rdns=$(echo "$info" | cut -d'|||' -f3)
 
       local top_urls
@@ -169,7 +211,7 @@ check_nginx_flood() {
     done
 }
 
-# ─── Monitor 3: Fail2ban ban baru ────────────────────────────
+# ─── Monitor 3: Fail2ban ban baru ── FIX: nama jail ──────────
 check_new_bans() {
   local f2b_log="/var/log/fail2ban.log"
   [ ! -f "$f2b_log" ] && return
@@ -182,26 +224,35 @@ check_new_bans() {
   echo "$cur" > "$sf"
   [ "$cur" -le "$last" ] && return
 
-  tail -$((cur - last + 1)) "$f2b_log" 2>/dev/null | grep " Ban " | \
-    grep -oP 'Ban \K[\d.]+' | sort -u | \
+  local new_lines
+  new_lines=$(tail -$((cur - last + 1)) "$f2b_log" 2>/dev/null)
+
+  echo "$new_lines" | grep " Ban " | grep -oP 'Ban \K[\d.]+' | sort -u | \
     while read -r ip; do
       on_cooldown "f2b_${ip}" && continue
       set_cooldown "f2b_${ip}"
 
       local info loc org rdns
       info=$(ip_info "$ip")
-      loc=$(echo "$info" | cut -d'|||' -f1)
-      org=$(echo "$info" | cut -d'|||' -f2)
+      loc=$(echo "$info"  | cut -d'|||' -f1)
+      org=$(echo "$info"  | cut -d'|||' -f2)
       rdns=$(echo "$info" | cut -d'|||' -f3)
 
+      # ── FIX: ambil nama jail yang benar ──────────────────
+      # Format log fail2ban: "2026-01-01 00:00:00,000 fail2ban.actions [PID]: NOTICE  [jail-name] Ban IP"
+      # Sebelumnya ambil angka PID, sekarang ambil nama jail di dalam []
       local jail
-      jail=$(tail -$((cur - last + 1)) "$f2b_log" 2>/dev/null | \
-        grep "Ban ${ip}" | grep -oP '\[\K[^\]]+' | head -1)
+      jail=$(echo "$new_lines" | grep "Ban ${ip}" | \
+        grep -oP 'NOTICE\s+\[\K[^\]]+' | head -1)
+      # Fallback: ambil semua [] dan filter yang bukan angka
+      [ -z "$jail" ] && jail=$(echo "$new_lines" | grep "Ban ${ip}" | \
+        grep -oP '\[\K[^\]]+(?=\])' | grep -v '^[0-9]*$' | head -1)
+      [ -z "$jail" ] && jail="fail2ban"
 
       local total
       total=$(ipset list ptero-banned 2>/dev/null | grep -c "^[0-9]" || echo "?")
 
-      tg "🔒 <b>IP PERMANENT BANNED!</b>\n\n🌐 <b>IP:</b> <code>${ip}</code>\n🌍 <b>Lokasi:</b> ${loc}\n🏢 <b>ISP/Org:</b> ${org}\n🔍 <b>rDNS:</b> ${rdns}\n🏷️ <b>Trigger:</b> ${jail:-unknown}\n🕐 <b>Waktu:</b> ${now}\n📊 <b>Total Banned:</b> ${total} IP\n\n💡 Unban: <code>ptero-ban del ${ip}</code>"
+      tg "🔒 <b>IP PERMANENT BANNED!</b>\n\n🌐 <b>IP:</b> <code>${ip}</code>\n🌍 <b>Lokasi:</b> ${loc}\n🏢 <b>ISP/Org:</b> ${org}\n🔍 <b>rDNS:</b> ${rdns}\n🏷️ <b>Trigger:</b> ${jail}\n🕐 <b>Waktu:</b> ${now}\n📊 <b>Total Banned:</b> ${total} IP\n\n💡 Unban: <code>ptero-ban del ${ip}</code>"
     done
 }
 
@@ -212,17 +263,15 @@ check_vps_resources() {
 
   cpu=$(top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{print $2}' | cut -d'.' -f1 | tr -d '%,')
   ram_total=$(free -m | awk 'NR==2{print $2}')
-  ram_used=$(free -m | awk 'NR==2{print $3}')
+  ram_used=$(free -m  | awk 'NR==2{print $3}')
   [ "${ram_total:-0}" -gt 0 ] && ram_pct=$((ram_used * 100 / ram_total))
   disk_pct=$(df / | awk 'NR==2{print $5}' | tr -d '%')
 
   if [ "${cpu:-0}" -gt 90 ] || [ "$ram_pct" -gt 95 ] || [ "${disk_pct:-0}" -gt 95 ]; then
     on_cooldown "vps_overload" && return
     set_cooldown "vps_overload"
-
     local top_procs
     top_procs=$(ps aux --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=6{printf "• %s %.1f%%\n",$11,$3}')
-
     tg "🔥 <b>VPS OVERLOAD!</b>\n\n⚙️ <b>CPU:</b> ${cpu}%\n🧠 <b>RAM:</b> ${ram_used}/${ram_total}MB (${ram_pct}%)\n💾 <b>Disk:</b> ${disk_pct}%\n🕐 <b>Waktu:</b> ${now}\n\n🔝 <b>Top Proses:</b>\n${top_procs}\n\n⚠️ <i>Kemungkinan sedang di-DDoS!</i>"
   fi
 }
@@ -260,7 +309,8 @@ check_syn_flood() {
 # ─── Notif startup ────────────────────────────────────────────
 tg "✅ <b>DDoS Monitor Aktif!</b>\n\n🖥️ <b>VPS:</b> <code>$(hostname -I | awk '{print $1}')</code>\n⚙️ <b>Threshold:</b> ${THRESHOLD}\n⏱️ <b>Interval:</b> ${INTERVAL}s\n🕐 <b>Start:</b> $(date '+%d/%m/%Y %H:%M:%S')\n\n📡 <b>Monitor aktif:</b>\n• Connection flood\n• HTTP request flood\n• Fail2ban auto ban\n• VPS overload\n• SYN flood\n\n🔒 Semua IP terdeteksi → <b>PERMANENT BAN</b>"
 
-echo "DDoS Monitor started — threshold: ${THRESHOLD}, interval: ${INTERVAL}s"
+echo "DDoS Monitor v3 started — threshold: ${THRESHOLD}, interval: ${INTERVAL}s"
+
 while true; do
   check_connections
   check_nginx_flood
@@ -272,9 +322,8 @@ done
 MONEOF
 
 chmod +x "$MONITOR_SCRIPT"
-echo "✅ Monitor script diupdate"
+echo "✅ Monitor script v3 dibuat"
 
-# Pastikan service file ada
 cat > "$SERVICE_FILE" << SVCEOF
 [Unit]
 Description=Pterodactyl DDoS Monitor by baniwwDeveloper
@@ -300,13 +349,13 @@ sleep 3
 if systemctl is-active --quiet ptero-ddos-monitor; then
   echo ""
   echo "════════════════════════════════════════════"
-  echo "  ✅ DDOS MONITOR BERHASIL DIUPDATE!"
+  echo "  ✅ DDOS MONITOR v3 BERHASIL DIUPDATE!"
   echo "════════════════════════════════════════════"
   echo ""
   echo "✅ Fix yang diterapkan:"
-  echo "   • \\n sekarang jadi newline beneran di Telegram"
-  echo "   • ip_info timeout diperpanjang + fallback geoip"
-  echo "   • State diinit, tidak baca log lama lagi"
+  echo "   • ip_info: retry 3x + cache 1 jam + fallback geoip"
+  echo "   • Jail name: sekarang tampil nama jail bukan angka PID"
+  echo "   • State init: tidak baca log lama"
   echo ""
   echo "📲 Notif startup akan masuk ke Telegram sekarang"
 else
