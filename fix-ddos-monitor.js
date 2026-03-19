@@ -222,7 +222,7 @@ Type=simple
 ExecStart=$MONITOR_SCRIPT
 Restart=always
 RestartSec=10
-StandardOutput=journal
+StandardOutput=journal 
 StandardError=journal
 
 [Install]
