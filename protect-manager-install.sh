@@ -3,7 +3,8 @@
 # by @baniwwwXD | baniwwDeveloper
 # Install Protect Manager ke panel Pterodactyl
 
-set -euo pipefail
+set -uo pipefail
+# Note: sengaja tidak pakai -e agar error handling manual lebih aman
 
 PANEL_DIR="/var/www/pterodactyl"
 CONTROLLER_SRC="https://raw.githubusercontent.com/Xbanz22/security-pterodactyl-baniww/main/ProtectManagerController.php"
@@ -13,7 +14,6 @@ SCRIPTS_STORE="${PANEL_DIR}/storage/protect-scripts"
 MARKER="BANIWW_PROTECT_MANAGER"
 
 # ── Auto-detect routes file ────────────────────────────────────
-# Pterodactyl modern pakai routes/admin.php, bukan web.php
 if   [ -f "${PANEL_DIR}/routes/admin.php" ];  then ROUTES_FILE="${PANEL_DIR}/routes/admin.php"
 elif [ -f "${PANEL_DIR}/routes/web.php" ];    then ROUTES_FILE="${PANEL_DIR}/routes/web.php"
 elif [ -f "${PANEL_DIR}/routes/base.php" ];   then ROUTES_FILE="${PANEL_DIR}/routes/base.php"
@@ -45,12 +45,17 @@ info "Routes file: $ROUTES_FILE"
 
 # ── Install controller ─────────────────────────────────────────
 info "Install controller..."
-curl -fsSL "$CONTROLLER_SRC" -o "$CONTROLLER_DST" || {
-  # Fallback: script sudah include controller inline
-  warn "Gagal download controller, skip..."
-}
-chmod 644 "$CONTROLLER_DST" 2>/dev/null || true
-ok "Controller: $CONTROLLER_DST"
+if curl -fsSL "$CONTROLLER_SRC" -o "$CONTROLLER_DST"; then
+  chmod 644 "$CONTROLLER_DST"
+  ok "Controller downloaded: $CONTROLLER_DST"
+else
+  # FIX: kalau download gagal, jangan lanjut kalau file tidak ada
+  if [ ! -f "$CONTROLLER_DST" ]; then
+    fail "Gagal download controller dan file tidak ada. Cek koneksi atau URL: $CONTROLLER_SRC"
+  else
+    warn "Gagal re-download controller, menggunakan file yang sudah ada."
+  fi
+fi
 
 # ── Buat direktori views ───────────────────────────────────────
 info "Membuat direktori views..."
@@ -60,14 +65,20 @@ mkdir -p "$VIEWS_DIR"
 BASE_URL="https://raw.githubusercontent.com/Xbanz22/security-pterodactyl-baniww/main"
 
 info "Download index.blade.php..."
-curl -fsSL "${BASE_URL}/protect-manager-index.blade.php" -o "${VIEWS_DIR}/index.blade.php"
-chmod 644 "${VIEWS_DIR}/index.blade.php"
-ok "View index siap"
+if curl -fsSL "${BASE_URL}/protect-manager-index.blade.php" -o "${VIEWS_DIR}/index.blade.php"; then
+  chmod 644 "${VIEWS_DIR}/index.blade.php"
+  ok "View index siap"
+else
+  fail "Gagal download index.blade.php"
+fi
 
 info "Download config.blade.php..."
-curl -fsSL "${BASE_URL}/protect-manager-config.blade.php" -o "${VIEWS_DIR}/config.blade.php"
-chmod 644 "${VIEWS_DIR}/config.blade.php"
-ok "View config siap"
+if curl -fsSL "${BASE_URL}/protect-manager-config.blade.php" -o "${VIEWS_DIR}/config.blade.php"; then
+  chmod 644 "${VIEWS_DIR}/config.blade.php"
+  ok "View config siap"
+else
+  fail "Gagal download config.blade.php"
+fi
 
 # ── Buat storage untuk custom scripts ──────────────────────────
 info "Setup storage custom scripts..."
@@ -76,51 +87,39 @@ chown www-data:www-data "$SCRIPTS_STORE" 2>/dev/null || true
 chmod 750 "$SCRIPTS_STORE"
 ok "Storage: $SCRIPTS_STORE"
 
-# ── Inject routes ke web.php ───────────────────────────────────
+# ── Inject routes ──────────────────────────────────────────────
 info "Inject routes..."
 
-# Cek sudah ada
 if grep -q "protect-manager" "$ROUTES_FILE" 2>/dev/null; then
   warn "Routes sudah ada, skip."
 else
-  # Tambahkan use statement kalau belum ada
-  # admin.php Pterodactyl pakai format 'use' di atas file
-  if ! grep -q "ProtectManagerController" "$ROUTES_FILE"; then
-    # Coba inject setelah use statement lain yang sudah ada
-    if grep -q "^use " "$ROUTES_FILE"; then
-      # Ada use statement — inject setelah use terakhir
-      sed -i "/^use .*Controller;$/a use Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\ProtectManagerController;" "$ROUTES_FILE" 2>/dev/null || true
-    else
-      # Tidak ada use statement — inject di baris pertama setelah <?php
-      sed -i "/^<?php/a use Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\ProtectManagerController;" "$ROUTES_FILE" 2>/dev/null || true
-    fi
-  fi
-
-  # Inject route group sebelum penutup group admin
-  ROUTE_BLOCK=$(cat << 'ROUTEEOF'
-
-    // ── Protect Manager (by @baniwwwXD) ──────────────────────
-    Route::prefix('/protect-manager')->name('admin.protect-manager.')->group(function () {
-        Route::get('/',                [ProtectManagerController::class, 'index'])->name('index');
-        Route::get('/config',          [ProtectManagerController::class, 'config'])->name('config');
-        Route::get('/status',          [ProtectManagerController::class, 'statusAll'])->name('status');
-        Route::post('/install',        [ProtectManagerController::class, 'install'])->name('install');
-        Route::post('/uninstall',      [ProtectManagerController::class, 'uninstall'])->name('uninstall');
-        Route::post('/install-batch',  [ProtectManagerController::class, 'installBatch'])->name('install-batch');
-        Route::post('/save-config',    [ProtectManagerController::class, 'saveConfig'])->name('save-config');
-        Route::post('/edit-protection',[ProtectManagerController::class, 'editProtection'])->name('edit-protection');
-        Route::post('/upload-script',  [ProtectManagerController::class, 'uploadScript'])->name('upload-script');
-    });
-ROUTEEOF
-)
   # Backup routes dulu
   cp "$ROUTES_FILE" "${ROUTES_FILE}.bak_$(date +%Y%m%d%H%M%S)"
 
-  # Inject sebelum baris terakhir yang berisi closing "}); // admin group"
+  # FIX: inject use statement hanya sekali, pakai python agar aman
+  # FIX: variable expansion — heredoc tanpa quote agar $ROUTES_FILE di-expand
   python3 - << PYEOF
 import re
-with open('$ROUTES_FILE', 'r') as f:
+
+routes_file = "$ROUTES_FILE"
+
+with open(routes_file, 'r') as f:
     content = f.read()
+
+use_statement = "use Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\ProtectManagerController;"
+
+# Inject use statement hanya kalau belum ada
+if "ProtectManagerController" not in content:
+    # Cari use statement terakhir yang ada di file
+    use_matches = list(re.finditer(r'^use .+;$', content, re.MULTILINE))
+    if use_matches:
+        # Inject setelah use statement terakhir (bukan setiap baris)
+        last_use = use_matches[-1]
+        insert_pos = last_use.end()
+        content = content[:insert_pos] + "\n" + use_statement + content[insert_pos:]
+    else:
+        # Tidak ada use statement, inject setelah <?php
+        content = re.sub(r'(<\?php\s*\n)', r'\1' + use_statement + "\n", content, count=1)
 
 route_block = """
     // ── Protect Manager (by @baniwwwXD) ──────────────────────
@@ -137,26 +136,35 @@ route_block = """
     });
 """
 
-# Inject sebelum baris "}); // end admin" atau closing baris terakhir
 lines = content.split('\n')
-# Cari baris terakhir yang ada '})'
+
+# FIX: scan SEMUA baris, ambil index TERAKHIR yang mengandung '});'
+# (bukan break di pertama yang match)
 last_close = -1
 for i, line in enumerate(lines):
-    if '});' in line and ('admin' in line.lower() or i == len(lines) - 3):
+    stripped = line.strip()
+    if stripped.startswith('});'):
         last_close = i
-        break
+
 if last_close == -1:
     # Fallback: inject di akhir file
     content += route_block
+    print("Warning: closing }); tidak ditemukan, route diinject di akhir file")
 else:
     lines.insert(last_close, route_block)
     content = '\n'.join(lines)
+    print(f"Routes injected sebelum baris {last_close}: {lines[last_close + 1].strip()!r}")
 
-with open('$ROUTES_FILE', 'w') as f:
+with open(routes_file, 'w') as f:
     f.write(content)
 print('Routes injected successfully')
 PYEOF
-  ok "Routes berhasil diinject"
+
+  if [ $? -eq 0 ]; then
+    ok "Routes berhasil diinject"
+  else
+    fail "Gagal inject routes"
+  fi
 fi
 
 # ── Inject Protect Manager ke sidebar ─────────────────────────
@@ -169,10 +177,14 @@ if grep -q "$SIDEBAR_MARKER" "$SIDEBAR_FILE" 2>/dev/null; then
 else
   if [ -f "$SIDEBAR_FILE" ]; then
     cp "$SIDEBAR_FILE" "${SIDEBAR_FILE}.bak_$(date +%Y%m%d%H%M%S)"
-    # Inject setelah menu Settings
-    sed -i "s|route('admin.settings')|route('admin.settings')|" "$SIDEBAR_FILE"
+
+    # FIX: variable expansion — heredoc tanpa quote
     python3 - << PYEOF2
-with open('$SIDEBAR_FILE', 'r') as f:
+import re
+
+sidebar_file = "$SIDEBAR_FILE"
+
+with open(sidebar_file, 'r') as f:
     content = f.read()
 
 sidebar_item = """
@@ -183,20 +195,36 @@ sidebar_item = """
                     </a>
                 </li>"""
 
-# Inject setelah Settings menu item
-import re
-content = re.sub(
-    r"(admin\.settings.*?</li>)",
-    r"\1" + sidebar_item,
-    content,
-    count=1,
-    flags=re.DOTALL
-)
-with open('$SIDEBAR_FILE', 'w') as f:
+# FIX: regex yang benar — inject setelah </li> pertama yang mengandung admin.settings
+# Cari pola <li>...</li> yang berisi admin.settings
+pattern = r"(admin\.settings[^<]*(?:<[^>]+>)*\s*</li>)"
+match = re.search(pattern, content, re.DOTALL)
+
+if match:
+    insert_pos = match.end()
+    content = content[:insert_pos] + sidebar_item + content[insert_pos:]
+    print("Sidebar item injected setelah menu Settings")
+else:
+    # Fallback: coba inject sebelum </ul> pertama dalam sidebar
+    content = re.sub(
+        r'(</ul>\s*</div>\s*<!-- sidebar -->)',
+        sidebar_item + r'\1',
+        content,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE
+    )
+    print("Warning: Settings menu tidak ditemukan, inject menggunakan fallback")
+
+with open(sidebar_file, 'w') as f:
     f.write(content)
-print('Sidebar injected')
+print("Sidebar updated")
 PYEOF2
-    ok "Menu Protect Manager ditambahkan ke sidebar"
+
+    if [ $? -eq 0 ]; then
+      ok "Menu Protect Manager ditambahkan ke sidebar"
+    else
+      warn "Gagal inject sidebar, lanjut tanpa sidebar menu"
+    fi
   else
     warn "Sidebar file tidak ditemukan, skip."
   fi
