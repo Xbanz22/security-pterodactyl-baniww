@@ -9,9 +9,15 @@ PANEL_DIR="/var/www/pterodactyl"
 CONTROLLER_SRC="https://raw.githubusercontent.com/Xbanz22/security-pterodactyl-baniww/main/ProtectManagerController.php"
 CONTROLLER_DST="${PANEL_DIR}/app/Http/Controllers/Admin/ProtectManagerController.php"
 VIEWS_DIR="${PANEL_DIR}/resources/views/admin/protect-manager"
-ROUTES_FILE="${PANEL_DIR}/routes/web.php"
 SCRIPTS_STORE="${PANEL_DIR}/storage/protect-scripts"
 MARKER="BANIWW_PROTECT_MANAGER"
+
+# ── Auto-detect routes file ────────────────────────────────────
+# Pterodactyl modern pakai routes/admin.php, bukan web.php
+if   [ -f "${PANEL_DIR}/routes/admin.php" ];  then ROUTES_FILE="${PANEL_DIR}/routes/admin.php"
+elif [ -f "${PANEL_DIR}/routes/web.php" ];    then ROUTES_FILE="${PANEL_DIR}/routes/web.php"
+elif [ -f "${PANEL_DIR}/routes/base.php" ];   then ROUTES_FILE="${PANEL_DIR}/routes/base.php"
+else ROUTES_FILE="${PANEL_DIR}/routes/admin.php"; fi
 
 GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}✅ $1${NC}"; }
@@ -34,7 +40,8 @@ fi
 
 # ── Cek panel dir ──────────────────────────────────────────────
 [ -d "$PANEL_DIR" ] || fail "Direktori panel tidak ditemukan di $PANEL_DIR"
-[ -f "$ROUTES_FILE" ] || fail "routes/web.php tidak ditemukan"
+[ -f "$ROUTES_FILE" ] || fail "Routes file tidak ditemukan! Cek isi folder: ls ${PANEL_DIR}/routes/"
+info "Routes file: $ROUTES_FILE"
 
 # ── Install controller ─────────────────────────────────────────
 info "Install controller..."
@@ -77,9 +84,16 @@ if grep -q "protect-manager" "$ROUTES_FILE" 2>/dev/null; then
   warn "Routes sudah ada, skip."
 else
   # Tambahkan use statement kalau belum ada
+  # admin.php Pterodactyl pakai format 'use' di atas file
   if ! grep -q "ProtectManagerController" "$ROUTES_FILE"; then
-    sed -i "s/use Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\SettingsController;/use Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\SettingsController;\nuse Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\ProtectManagerController;/" "$ROUTES_FILE" 2>/dev/null || \
-    sed -i "1a use Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\ProtectManagerController;" "$ROUTES_FILE"
+    # Coba inject setelah use statement lain yang sudah ada
+    if grep -q "^use " "$ROUTES_FILE"; then
+      # Ada use statement — inject setelah use terakhir
+      sed -i "/^use .*Controller;$/a use Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\ProtectManagerController;" "$ROUTES_FILE" 2>/dev/null || true
+    else
+      # Tidak ada use statement — inject di baris pertama setelah <?php
+      sed -i "/^<?php/a use Pterodactyl\\\\Http\\\\Controllers\\\\Admin\\\\ProtectManagerController;" "$ROUTES_FILE" 2>/dev/null || true
+    fi
   fi
 
   # Inject route group sebelum penutup group admin
