@@ -274,6 +274,20 @@ function updateHeaderStats() {
   if (bar) bar.style.width = (total > 0 ? Math.round((dots/total)*100) : 0) + '%';
 }
 
+// Verifikasi status real dari server setelah install/uninstall
+async function verifyAndUpdateStatus(ids) {
+  try {
+    const res  = await fetch('{{ route("admin.protect-manager.status") }}');
+    const data = await res.json();
+    const statuses = data.statuses || {};
+    const toUpdate = ids && ids.length ? ids : Object.keys(statuses);
+    toUpdate.forEach(id => {
+      if (statuses[id] !== undefined) setStatus(id, statuses[id]);
+    });
+    updateHeaderStats();
+  } catch(e) { /* silent */ }
+}
+
 async function installOne(id) {
   const btn = document.getElementById('btn-' + id);
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="pm-spinner"></span>'; }
@@ -286,9 +300,8 @@ async function installOne(id) {
     });
     const data = await res.json();
     showAlert(data.message, data.ok ? 'success' : 'warning');
-    setStatus(id, data.installed ?? data.ok);
-    updateHeaderStats();
     if (data.output) showOutput((data.ok ? '✅ ' : '⚠️ ') + 'Output Install', data.output);
+    await verifyAndUpdateStatus([id]);
   } catch(e) {
     showAlert('❌ Gagal terhubung ke server.', 'danger');
     if (btn) { btn.disabled = false; btn.textContent = '⚡ Install'; }
@@ -308,9 +321,8 @@ async function uninstallOne(id) {
     });
     const data = await res.json();
     showAlert(data.message, data.ok ? 'success' : 'danger');
-    if (data.ok) { setStatus(id, false); updateHeaderStats(); }
-    else if (btn) { btn.disabled = false; btn.textContent = '🗑️ Uninstall'; }
     if (data.output) showOutput((data.ok ? '✅ ' : '❌ ') + 'Output Uninstall', data.output);
+    await verifyAndUpdateStatus([id]);
   } catch(e) {
     showAlert('❌ Gagal terhubung ke server.', 'danger');
     if (btn) { btn.disabled = false; btn.textContent = '🗑️ Uninstall'; }
